@@ -287,6 +287,8 @@ pub(crate) fn parse(pid: Pid) -> Result<impl Iterator<Item = Result<MapsEntry>>>
 /// symbolization efforts.
 pub(crate) fn filter_relevant(entry: &MapsEntry) -> bool {
     // Only readable (r---) or executable (--x-) entries are of relevance.
+    // NB: Please keep this logic in sync with flags being used by in
+    //     `procmap_query`.
     if (entry.mode & 0b1010) == 0 {
         return false
     }
