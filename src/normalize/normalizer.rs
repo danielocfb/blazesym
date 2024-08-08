@@ -1,3 +1,6 @@
+use std::fs::File;
+use std::os::fd::AsFd as _;
+
 use crate::file_cache::FileCache;
 use crate::insert_map::InsertMap;
 use crate::maps;
@@ -7,12 +10,14 @@ use crate::util;
 #[cfg(feature = "tracing")]
 use crate::util::Hexify;
 use crate::Addr;
+use crate::ErrorExt as _;
 use crate::Pid;
 use crate::Result;
 
 use super::buildid::BuildId;
 use super::buildid::DefaultBuildIdReader;
 use super::buildid::NoBuildIdReader;
+use super::ioctl::query_procmap;
 use super::user;
 use super::user::normalize_sorted_user_addrs_with_entries;
 use super::user::UserOutput;
@@ -237,24 +242,53 @@ impl Normalizer {
     where
         A: ExactSizeIterator<Item = Addr> + Clone,
     {
-        if !self.cache_vmas {
-            let mut entry_iter = maps::parse_filtered(pid)?;
-            let entries = |_addr| entry_iter.next();
-            self.normalize_user_addrs_impl(addrs, entries, map_files)
-        } else {
-            let parsed = self.cached_entries.get_or_try_insert(pid, || {
-                // If we use the cached maps entries but don't have anything
-                // cached yet, then just parse the file eagerly and take it from
-                // there.
-                let parsed = maps::parse_filtered(pid)?
-                    .collect::<Result<Vec<_>>>()?
-                    .into_boxed_slice();
-                Result::<Box<[maps::MapsEntry]>>::Ok(parsed)
-            })?;
+        if self.procmap_query_ioctl {
+            let pid = Pid::Slf;
+            let path = format!("/proc/{pid}/maps");
+            let file = File::open(&path)
+                .with_context(|| format!("failed to open `{path}` for reading"))?;
 
-            let mut entry_iter = parsed.iter().map(Ok);
-            let entries = |_addr| entry_iter.next();
-            self.normalize_user_addrs_impl(addrs, entries, map_files)
+            if !self.cache_vmas {
+                let entries =
+                    move |addr| query_procmap(file.as_fd(), pid, addr, self.build_ids).transpose();
+                self.normalize_user_addrs_impl(addrs, entries, map_files)
+            } else {
+                let entries = self.cached_entries.get_or_try_insert(pid, || {
+                    let mut entries = Vec::new();
+                    let mut next_addr = 0;
+                    while let Some(entry) =
+                        query_procmap(file.as_fd(), pid, next_addr, self.build_ids)?
+                    {
+                        next_addr = entry.range.end;
+                        let () = entries.push(entry);
+                    }
+                    Ok(entries.into_boxed_slice())
+                })?;
+
+                let mut entry_iter = entries.iter().map(Ok);
+                let entries = |_addr| entry_iter.next();
+                self.normalize_user_addrs_impl(addrs, entries, map_files)
+            }
+        } else {
+            if !self.cache_vmas {
+                let mut entry_iter = maps::parse_filtered(pid)?;
+                let entries = |_addr| entry_iter.next();
+                self.normalize_user_addrs_impl(addrs, entries, map_files)
+            } else {
+                let parsed = self.cached_entries.get_or_try_insert(pid, || {
+                    // If we use the cached maps entries but don't have anything
+                    // cached yet, then just parse the file eagerly and take it from
+                    // there.
+                    let parsed = maps::parse_filtered(pid)?
+                        .collect::<Result<Vec<_>>>()?
+                        .into_boxed_slice();
+                    Result::<Box<[maps::MapsEntry]>>::Ok(parsed)
+                })?;
+
+                let mut entry_iter = parsed.iter().map(Ok);
+                let entries = |_addr| entry_iter.next();
+                self.normalize_user_addrs_impl(addrs, entries, map_files)
+            }
         }
     }
 
